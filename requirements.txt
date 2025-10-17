@@ -12,6 +12,7 @@ fonttools==4.60.1
 fsspec==2025.9.0
 glfw==2.10.0
 gymnasium==1.2.1
+gymnasium-robotics==1.4.1
 imageio==2.37.0
 importlib-resources==6.5.2
 jinja2==3.1.6
@@ -39,6 +40,7 @@ nvidia-nvjitlink-cu12==12.8.93
 nvidia-nvtx-cu12==12.8.90
 packaging==25.0
 pandas==2.3.3
+pettingzoo==1.25.0
 pillow==11.3.0
 pyopengl==3.1.10
 pyparsing==3.2.5
