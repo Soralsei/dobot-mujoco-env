@@ -25,7 +25,6 @@ def color_range(s: float, v: float, n: int):
     colors = []
 
     hues = np.linspace(0.0, 1.0, n + 1)
-    print(hues)
 
     for hue in hues[:-1]:
 
@@ -45,8 +44,6 @@ def color_range(s: float, v: float, n: int):
             colors.append([f, 0, 1])
         if index == 5:
             colors.append([1, 0, q])
-
-        print(colors[-1])
 
     return colors
 
@@ -99,7 +96,7 @@ def bodies_are_colliding(model: mj.MjModel, data: mj.MjData, body1_name, body2_n
     return False
 
 
-class DobotBlockEnv(MujocoRobotEnv):
+class DobotCubeStack(MujocoRobotEnv):
     metadata = {
         "render_modes": [
             "human",
@@ -111,6 +108,7 @@ class DobotBlockEnv(MujocoRobotEnv):
     def __init__(
         self,
         n_cubes=2,
+        action_frequency=20,  # Hz
         distance_threshold=0.01,
         n_substeps=1,
         default_camera_config=None,
@@ -118,6 +116,7 @@ class DobotBlockEnv(MujocoRobotEnv):
     ) -> None:
         self.n_cubes = n_cubes
         self.distance_threshold = distance_threshold
+        self.action_frequency = action_frequency
         self.mujoco_renderer = None
         super().__init__(
             default_camera_config=default_camera_config,
@@ -132,7 +131,6 @@ class DobotBlockEnv(MujocoRobotEnv):
         self.render()
 
     def _set_action(self, action) -> None:
-        action = np.clip(action, self.action_space.low, self.action_space.high)
         q_target = np.copy(self.data.ctrl)
 
         delta_q = action * DOBOT_MOTOR_LIMITS * self.dt
@@ -140,78 +138,148 @@ class DobotBlockEnv(MujocoRobotEnv):
 
         # update joint targets
         q_target = np.clip(q_target, *(self.jnt_ranges.T))
-        if q_target[-1] > 0.5:
-            self.suction_activated = True
+        q_target[-1] = (
+            action[-1] > 0.2 if not self.suction_activated else action[-1] > -0.2
+        )  # suction cup control
+        self.suction_activated = bool(q_target[-1])
 
         self.data.ctrl = q_target
 
+    def step(self, action):
+        """Run one timestep of the environment's dynamics using the agent actions.
+
+        Args:
+            action (np.ndarray): Control action to be applied to the agent and update the simulation. Should be of shape :attr:`action_space`.
+
+        Returns:
+            observation (dictionary): Next observation due to the agent actions .It should satisfy the `GoalEnv` :attr:`observation_space`.
+            reward (integer): The reward as a result of taking the action. This is calculated by :meth:`compute_reward` of `GoalEnv`.
+            terminated (boolean): Whether the agent reaches the terminal state. This is calculated by :meth:`compute_terminated` of `GoalEnv`.
+            truncated (boolean): Whether the truncation condition outside the scope of the MDP is satisfied. Timically, due to a timelimit, but
+            it is also calculated in :meth:`compute_truncated` of `GoalEnv`.
+            info (dictionary): Contains auxiliary diagnostic information (helpful for debugging, learning, and logging). In this case there is a single
+            key `is_success` with a boolean value, True if the `achieved_goal` is the same as the `desired_goal`.
+        """
+        if np.array(action).shape != self.action_space.shape:
+            raise ValueError("Action dimension mismatch")
+
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self._set_action(action)
+
+        self._mujoco_step(action)
+
+        self._step_callback()
+
+        if self.render_mode == "human":
+            self.render()
+        obs = self._get_obs()
+
+        info = {
+            "is_success": self._is_success(obs["achieved_goal"], self.goal),
+            "grasped": self.grasped,
+            "suction_activated": self.suction_activated,
+        }
+
+        terminated = self.compute_terminated(
+            obs["achieved_goal"], obs["desired_goal"], info
+        )
+        truncated = self.compute_truncated(
+            obs["achieved_goal"], obs["desired_goal"], info
+        )
+
+        reward = self.compute_reward(obs["achieved_goal"], obs["desired_goal"], info)
+
+        return obs, reward, terminated, truncated, info
+
     def _is_success(self, achieved_goal, desired_goal) -> bool:
-        return np.linalg.norm(achieved_goal - desired_goal) < self.distance_threshold
+        return (
+            np.linalg.norm(achieved_goal[-3:] - desired_goal[-3:])
+            < self.distance_threshold
+        )  # pyright: ignore[reportReturnType]
 
     def compute_reward(self, achieved_goal, desired_goal, info) -> float:
-        # d_eef_cube = np.linalg.norm()
-        d = np.linalg.norm(achieved_goal - desired_goal)
+        if info.get("grasped", False):
+            d = np.linalg.norm(achieved_goal[-3:] - desired_goal[-3:])
+        else:
+            d = np.linalg.norm(achieved_goal[:3] - desired_goal[:3])
         reward = -d
         if info["is_success"]:
             reward += 5.0
-        return reward
+        return reward  # pyright: ignore[reportReturnType]
 
-    def compute_terminated(self, achieved_goal, desired_goal, info) -> bool:
+    def compute_terminated(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, achieved_goal, desired_goal, info
+    ) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
         return self._is_success(achieved_goal, desired_goal)
 
-    def compute_truncated(self, _achieved_goal, _desired_goal, _info) -> bool:
+    def compute_truncated(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, _achieved_goal, _desired_goal, _info
+    ) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
         return False
 
     def _step_callback(self) -> None:
-        print(f"Suction activated : {self.suction_activated}")
-        self.grasped = bodies_are_colliding(
-            self.model, self.data, EE_LINK_NAME, "cubeworld_0"
-        ) and self.suction_activated
+        n_steps = (1 / self.dt) / self.action_frequency
+        self.grasped = (
+            bodies_are_colliding(self.model, self.data, EE_LINK_NAME, "cube_0")
+            and self.suction_activated
+        )
+        # Only act on action_frequency
+        for _ in range(int(n_steps) - 1):
+            self.grasped = (
+                bodies_are_colliding(self.model, self.data, EE_LINK_NAME, "cube_0")
+                and self.suction_activated
+            )
+            mj.mj_step(self.model, self.data)
 
     def _initialize_simulation(self):
-        self.spec: mj.MjSpec = mj.MjSpec.from_file(self.fullpath)
+        self.mjspec: mj.MjSpec = mj.MjSpec.from_file(self.fullpath)
         self.jnt_ranges = np.array(
-            [self.spec.actuator(name).ctrlrange for name in DOBOT_ACT_NAMES]
+            [self.mjspec.actuator(name).ctrlrange for name in DOBOT_ACT_NAMES]
         )
-        self.act_targets = [self.spec.actuator(name).target for name in DOBOT_ACT_NAMES]
-        self.jnt_names = [jnt.name for jnt in self.spec.joints]
+        self.act_targets = [
+            self.mjspec.actuator(name).target for name in DOBOT_ACT_NAMES
+        ]
+        self.jnt_names = [jnt.name for jnt in self.mjspec.joints]
         self.grasped = False
 
         self._randomize_spec()
 
     def _randomize_spec(self):
-        self.randomized_spec = self.spec.copy()
+        self.randomized_spec = self.mjspec.copy()
 
         cube_specs = self._randomize_cube_domain()
-        cubes_site = self.randomized_spec.body("dobot").add_site(group=3)
+        cubes_frame = self.randomized_spec.worldbody.add_frame(
+            name="cubes_frame", pos=[0, 0, 0.177 * 2]
+        )
 
         for i, cube_spec in enumerate(cube_specs):
-            cubes_site.attach_body(cube_spec.worldbody, "cube", f"_{i}")
+            self.randomized_spec.attach(cube_spec, suffix=f"_{i}", frame=cubes_frame)
 
         self.model: mj.MjModel = self.randomized_spec.compile()
         self.data = mj.MjData(self.model)
         mj.mj_forward(self.model, self.data)
 
-        return bodies_are_colliding(self.model, self.data, "cubeworld_0", "cubeworld_1")
+        return not bodies_are_colliding(self.model, self.data, "cube_0", "cube_1")
 
-    def _reset_sim(self):
-        self._randomize_spec()
+    def _reset_sim(self) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        is_valid = self._randomize_spec()
         self.grasped = False
         self.suction_activated = False
 
         # Weird hack to update the viewer when randomizing the domain
         # and recompiling the randomized spec
-        self.render()
         if self.mujoco_renderer is not None:
             viewer = self.mujoco_renderer._viewers.get(self.render_mode)
             if viewer is not None:
                 viewer.model = self.model
                 viewer.data = self.data
 
-        return True
+        return is_valid
 
     def _sample_goal(self):
-        return self.data.body("cubeworld_1").xpos + np.array([0, 0, 0.02])
+        desired_goal_grasp = self.data.body("cube_0").xpos + np.array([0, 0, 0.02])
+        desired_goal_cube = self.data.body("cube_1").xpos + np.array([0, 0, 0.02])
+        return np.concatenate((desired_goal_grasp, desired_goal_cube))
 
     def _get_obs(self):
         qpos = [
@@ -225,31 +293,31 @@ class DobotBlockEnv(MujocoRobotEnv):
             if name in self.jnt_names
         ]
         ee_pos = self.data.body(EE_LINK_NAME).xpos
-        ee_quat = self.data.body(EE_LINK_NAME).xquat
         ee_vel = np.zeros(6)
         mj.mj_objectVelocity(
             self.model,
             self.data,
             mj.mjtObj.mjOBJ_BODY,
-            self.spec.body(EE_LINK_NAME).id,
+            self.mjspec.body(EE_LINK_NAME).id,
             ee_vel,
             0,
         )
         ee_vel = ee_vel[3:]
-        cubeA_pos = self.data.body("cubeworld_0").xpos
-        cubeA_quat = self.data.body("cubeworld_0").xquat
-        cubeB_pos = self.data.body("cubeworld_1").xpos
-        cubeB_quat = self.data.body("cubeworld_1").xquat
+        cubeA_pos = self.data.body("cube_0").xpos
+        cubeA_quat = self.data.body("cube_0").xquat
+        cubeB_pos = self.data.body("cube_1").xpos
+        cubeB_quat = self.data.body("cube_1").xquat
 
         return {
-            "achieved_goal": cubeA_pos,
-            "desired_goal": self.goal,
+            "achieved_goal": np.concatenate((ee_pos, cubeA_pos)),
+            "desired_goal": np.concatenate(
+                (cubeA_pos + np.array([0, 0, 0.02]), cubeB_pos + np.array([0, 0, 0.02]))
+            ),
             "observation": np.concatenate(
                 (
                     qpos,
                     qdot,
                     ee_pos,
-                    ee_quat,
                     ee_vel,
                     cubeA_pos,
                     cubeA_quat,
@@ -278,13 +346,18 @@ class DobotBlockEnv(MujocoRobotEnv):
             coords = np.array([x, y])
             coords_rot = PI2_ROT @ coords.T
 
-            cube_spec.worldbody.pos = [*coords_rot, TABLE_THICKNESS]
-            cube_spec.worldbody.add_geom(
+            cube_body = cube_spec.worldbody.add_body(name=f"cube")
+
+            cube_body.pos = np.array([*coords_rot, TABLE_THICKNESS + 0.01])
+            geom = cube_body.add_geom(
                 type=mj.mjtGeom.mjGEOM_BOX,
-                size=[0.02, 0.02, 0.02],
+                size=[0.02, 0.02, 0.02],  # m
                 rgba=[*colors[i], 1.0],
-                mass=np.random.uniform(0.01, 0.1),
+                mass=np.random.uniform(0.01, 0.1),  # kg
             )
+            cube_body.add_freejoint()
+            geom.solimp = np.array([1, 1, 0.001, 0.5, 2])
+            geom.solref = np.array([0.002, 1.0])
 
             specs.append(cube_spec)
 
@@ -292,15 +365,18 @@ class DobotBlockEnv(MujocoRobotEnv):
 
 
 if __name__ == "__main__":
-    env = DobotBlockEnv(render_mode="human")
+    env = DobotCubeStack(render_mode="human")
 
     env.reset(seed=1234)
 
-    i = 0
-
     while True:
-        if i % 1000 == 0:
+        act = np.random.uniform(-1, 1, size=env.action_space.shape)
+        obs, r, terminated, truncated, info = env.step(act)
+        print(f"Observation : {obs}")
+        print(f"Reward : {r}")
+        print(f"Terminated : {terminated}")
+        print(f"truncated : {truncated}")
+        print(f"Info : {info}")
+
+        if terminated or truncated:
             env.reset()
-        act = np.ones(5)
-        env.step(act)
-        i += 1
