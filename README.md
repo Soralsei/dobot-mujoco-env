@@ -1,4 +1,4 @@
-dobot-mujoco-env
+# dobot-mujoco-env
 
 A compact MuJoCo environment for a Dobot manipulator and a small training example.
 
