@@ -1,12 +1,8 @@
-# TODO: Implement the mujoco environment for the Dobot robotic arm
-from abc import ABC, abstractmethod
 import os
-from typing import Any
 
 import numpy as np
-import gymnasium as gym
 import mujoco as mj
-from gymnasium_robotics.envs.robot_env import MujocoRobotEnv
+from .base_env import MujocoRobotEnv
 from gymnasium import spaces
 
 
@@ -79,7 +75,10 @@ DOBOT_ACT_NAMES = [
 EE_LINK_NAME = "suctionCup_link2"
 
 
-def bodies_are_colliding(model: mj.MjModel, data: mj.MjData, body1_name, body2_name):
+def bodies_are_colliding(
+    model: mj.MjModel, data: mj.MjData, body1_name: str, body2_name: str
+) -> bool:
+    """Check if two bodies are colliding."""
     body1_id = model.body(body1_name).id
     body2_id = model.body(body2_name).id
 
@@ -102,28 +101,23 @@ class DobotCubeStack(MujocoRobotEnv):
             "human",
             "rgb_array",
         ],
-        "render_fps": 1000,
+        "render_fps": 40,
     }
 
     def __init__(
         self,
-        n_cubes=2,
-        action_frequency=20,  # Hz
-        distance_threshold=0.01,
-        n_substeps=1,
         default_camera_config=None,
+        n_cubes=2,
         **kwargs,
     ) -> None:
         self.n_cubes = n_cubes
-        self.distance_threshold = distance_threshold
-        self.action_frequency = action_frequency
         self.mujoco_renderer = None
         super().__init__(
             default_camera_config=default_camera_config,
-            n_substeps=n_substeps,
             model_path=os.path.join(
                 os.path.dirname(__file__), "assets", "dobot_table_scene.xml"
             ),
+            decimation=25,  # 25 mujoco steps per env step
             initial_qpos=0,
             n_actions=5,
             **kwargs,
@@ -145,91 +139,39 @@ class DobotCubeStack(MujocoRobotEnv):
 
         self.data.ctrl = q_target
 
-    def step(self, action):
-        """Run one timestep of the environment's dynamics using the agent actions.
+    def _is_success(self, obs, info) -> bool:
 
-        Args:
-            action (np.ndarray): Control action to be applied to the agent and update the simulation. Should be of shape :attr:`action_space`.
-
-        Returns:
-            observation (dictionary): Next observation due to the agent actions .It should satisfy the `GoalEnv` :attr:`observation_space`.
-            reward (integer): The reward as a result of taking the action. This is calculated by :meth:`compute_reward` of `GoalEnv`.
-            terminated (boolean): Whether the agent reaches the terminal state. This is calculated by :meth:`compute_terminated` of `GoalEnv`.
-            truncated (boolean): Whether the truncation condition outside the scope of the MDP is satisfied. Timically, due to a timelimit, but
-            it is also calculated in :meth:`compute_truncated` of `GoalEnv`.
-            info (dictionary): Contains auxiliary diagnostic information (helpful for debugging, learning, and logging). In this case there is a single
-            key `is_success` with a boolean value, True if the `achieved_goal` is the same as the `desired_goal`.
-        """
-        if np.array(action).shape != self.action_space.shape:
-            raise ValueError("Action dimension mismatch")
-
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        self._set_action(action)
-
-        self._mujoco_step(action)
-
-        self._step_callback()
-
-        if self.render_mode == "human":
-            self.render()
-        obs = self._get_obs()
-
-        info = {
-            "is_success": self._is_success(obs["achieved_goal"], self.goal),
-            "grasped": self.grasped,
-            "suction_activated": self.suction_activated,
-        }
-
-        terminated = self.compute_terminated(
-            obs["achieved_goal"], obs["desired_goal"], info
-        )
-        truncated = self.compute_truncated(
-            obs["achieved_goal"], obs["desired_goal"], info
-        )
-
-        reward = self.compute_reward(obs["achieved_goal"], obs["desired_goal"], info)
-
-        return obs, reward, terminated, truncated, info
-
-    def _is_success(self, achieved_goal, desired_goal) -> bool:
         return (
-            np.linalg.norm(achieved_goal[-3:] - desired_goal[-3:])
-            < self.distance_threshold
-        )  # pyright: ignore[reportReturnType]
-
-    def compute_reward(self, achieved_goal, desired_goal, info) -> float:
-        if info.get("grasped", False):
-            d = np.linalg.norm(achieved_goal[-3:] - desired_goal[-3:])
-        else:
-            d = np.linalg.norm(achieved_goal[:3] - desired_goal[:3])
-        reward = -d
-        if info["is_success"]:
-            reward += 5.0
-        return reward  # pyright: ignore[reportReturnType]
-
-    def compute_terminated(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self, achieved_goal, desired_goal, info
-    ) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return self._is_success(achieved_goal, desired_goal)
-
-    def compute_truncated(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self, _achieved_goal, _desired_goal, _info
-    ) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return False
-
-    def _step_callback(self) -> None:
-        n_steps = (1 / self.dt) / self.action_frequency
-        self.grasped = (
-            bodies_are_colliding(self.model, self.data, EE_LINK_NAME, "cube_0")
-            and self.suction_activated
+            info["is_above_target"]
+            and info["is_cube_a_on_cube_b"]
+            and not info["grasped"]
         )
-        # Only act on action_frequency
-        for _ in range(int(n_steps) - 1):
-            self.grasped = (
-                bodies_are_colliding(self.model, self.data, EE_LINK_NAME, "cube_0")
-                and self.suction_activated
-            )
-            mj.mj_step(self.model, self.data)
+
+    def compute_reward(self, obs, info):
+        grasped = info.get("grasped", False)
+        d1 = info["ee_to_cube_a_distance"]
+        d2 = info["distance_to_target"]
+
+        reward = -d1 - d2
+        if grasped and not self.previous_grasped:
+            # Reward for successfully grasping the cube
+            reward += 2.0
+        elif (
+            not grasped and self.previous_grasped and info["distance_to_target"] > 0.02
+        ):
+            # Penalize dropping the cube if the cube is far from the target
+            reward -= 2.0
+
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def compute_terminated(self, obs, info) -> bool:
+        return self._is_success(obs, info)
+
+    def compute_truncated(self, obs, info) -> bool:
+        return False
 
     def _initialize_simulation(self):
         self.mjspec: mj.MjSpec = mj.MjSpec.from_file(self.fullpath)
@@ -261,8 +203,9 @@ class DobotCubeStack(MujocoRobotEnv):
 
         return not bodies_are_colliding(self.model, self.data, "cube_0", "cube_1")
 
-    def _reset_sim(self) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def _reset_sim(self) -> bool:
         is_valid = self._randomize_spec()
+        self.previous_grasped = False
         self.grasped = False
         self.suction_activated = False
 
@@ -303,29 +246,54 @@ class DobotCubeStack(MujocoRobotEnv):
             0,
         )
         ee_vel = ee_vel[3:]
-        cubeA_pos = self.data.body("cube_0").xpos
-        cubeA_quat = self.data.body("cube_0").xquat
-        cubeB_pos = self.data.body("cube_1").xpos
-        cubeB_quat = self.data.body("cube_1").xquat
+        self.ee_pos = ee_pos.copy()
+        self.cube_a_pos = self.data.body("cube_0").xpos.copy()
+        self.cube_a_quat = self.data.body("cube_0").xquat.copy()
+        self.cube_b_pos = self.data.body("cube_1").xpos.copy()
+        self.cube_b_quat = self.data.body("cube_1").xquat.copy()
 
-        return {
-            "achieved_goal": np.concatenate((ee_pos, cubeA_pos)),
-            "desired_goal": np.concatenate(
-                (cubeA_pos + np.array([0, 0, 0.02]), cubeB_pos + np.array([0, 0, 0.02]))
-            ),
-            "observation": np.concatenate(
-                (
-                    qpos,
-                    qdot,
-                    ee_pos,
-                    ee_vel,
-                    cubeA_pos,
-                    cubeA_quat,
-                    cubeB_pos,
-                    cubeB_quat,
-                )
-            ),
-        }
+        return np.concatenate(
+            (
+                qpos,
+                qdot,
+                ee_pos,
+                ee_vel,
+                self.cube_a_pos,
+                self.cube_a_quat,
+                self.cube_b_pos,
+                self.cube_b_quat,
+            )
+        )
+
+    def _get_info(self, observation):
+        info = super()._get_info(observation)
+
+        target_pos = self.cube_b_pos + np.array([0, 0, 0.02])
+        cube_a_bottom = self.cube_a_pos - np.array([0, 0, 0.02])
+        is_above_target = cube_a_bottom[2] >= target_pos[2]
+        is_cube_a_on_cube_b = bodies_are_colliding(
+            self.model, self.data, "cube_0", "cube_1"
+        )
+        is_ee_on_cube_a = bodies_are_colliding(
+            self.model, self.data, EE_LINK_NAME, "cube_0"
+        )
+        self.previous_grasped = self.grasped
+        self.grasped = is_ee_on_cube_a and self.suction_activated
+
+        info.update(
+            {
+                "grasped": self.grasped,
+                "suction_activated": self.suction_activated,
+                "is_above_target": is_above_target,
+                "is_cube_a_on_cube_b": is_cube_a_on_cube_b,
+                "distance_to_target": np.linalg.norm(cube_a_bottom - target_pos),
+                "ee_to_cube_a_distance": np.linalg.norm(
+                    (self.cube_a_pos + np.array([0, 0, 0.02])) - self.ee_pos
+                ),
+            }
+        )
+        info.update({"is_success": self._is_success(observation, info)})
+        return info
 
     def _randomize_cube_domain(self) -> list[mj.MjSpec]:
         """
